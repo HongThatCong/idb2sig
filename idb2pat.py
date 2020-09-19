@@ -3,7 +3,9 @@
 # 18/09/2020: HTC (aka TQN) - VinCSS (a member of Vingroup)
 #   - fix find_ref_log bug on x64
 #   - linter and some another small fixs
-#  Thank William Ballethin - FireEye
+#  19/09/2020: Cat Bui (computerline1z)
+#   - fix remain find_ref_loc bug
+#  Thank William Ballethin - FireEye, Cat Bui
 #
 
 import os
@@ -170,6 +172,14 @@ def find_ref_loc(config, ea, ref):
 
     o = idc.get_operand_type(ea, 0)
     if o == idc.o_near or o == idc.o_far or o == idc.o_reg:   # HTC - add o_far, o_reg operand
+        # Cat Bui - use get_operand_value to get real ref value
+        op_offset = 1
+        if o == idc.o_near:
+            op_offset = 0
+        real_addr = idc.get_operand_value(ea, op_offset)
+        if (ref != real_addr):
+            ref = real_addr
+
         ref = (ref - idc.get_item_end(ea)) & ((1 << config.pointer_size * 8) - 1)
 
     if idc.is_code(idc.get_full_flags(ea)):
@@ -424,7 +434,7 @@ def get_pat_file():
     name, _extension = os.path.splitext(idc.get_input_file_path())
     name = name + ".pat"
 
-    filename = idaapi.askfile_c(1, name, "Enter the name of the pattern file")
+    filename = idaapi.ask_file(1, name, "Enter the name of the pattern file")
     if filename is None:
         logger.debug("User did not choose a pattern file")
         return None
