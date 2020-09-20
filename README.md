@@ -1,5 +1,8 @@
 # idb2sig
 1. idb2pat.py:
+
+## idb2pat.py still have some bugs, please wait until I fix all of them. Thanks.
+
 Script of FireEye Flare, flare_ida.
 
 I have fix some bugs and make it works with x64 binaries.
