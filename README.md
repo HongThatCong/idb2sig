@@ -1,8 +1,6 @@
 # idb2sig
 1. idb2pat.py:
 
-## idb2pat.py still have some bugs, please wait until I fix all of them. Thanks.
-
 Script of FireEye Flare, flare_ida.
 
 I have fix some bugs and make it works with x64 binaries.
@@ -10,6 +8,8 @@ I have fix some bugs and make it works with x64 binaries.
 Please read this article to known how to uses this script:
 
 https://www.fireeye.com/blog/threat-research/2015/01/flare_ida_pro_script.html
+
+TODO: Add chooser form
 
 2. idb2sig:
 
