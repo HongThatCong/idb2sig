@@ -5,7 +5,12 @@
 #   - linter and some another small fixs
 #  19/09/2020: Cat Bui (computerline1z)
 #   - fix remain find_ref_loc bug
-#  Thank William Ballethin - FireEye, Cat Bui
+#  20/09/2020 - HTC
+#   - Rewrite the find_ref_loc, clean, refactor other code
+#   - Add form for user choose functions type to create pat file
+#  Thanks William Ballethin - FireEye, Cat Bui (computerline1z)
+#  Thanks NeatMonster for patmake.py. I copied a lot from your code
+#  Sorry for bad Python code, I don't have much experience with Python
 #
 
 import os
@@ -26,6 +31,7 @@ ALL_FUNCTIONS = 4
 USER_SELECT_FUNCTION = 5
 FUNCTION_MODE_MAX = USER_SELECT_FUNCTION
 
+MAX_FUNC_LEN = 0x8000
 
 # via: http://stackoverflow.com/questions/9816603/range-is-too-large-python
 # In Python 2.x, `xrange` can only handle Python 2.x ints,
@@ -60,7 +66,8 @@ g_logger = logging.getLogger("idb2pat")
 
 
 class Config(object):
-    def __init__(self, min_func_length=5, pointer_size=4, mode=ALL_FUNCTIONS, pat_append=False, logfile="", loglevel="DEBUG", logenabled=False):
+    def __init__(self, min_func_length=5, pointer_size=4, mode=NON_AUTO_FUNCTIONS,
+                 pat_append=True, logfile="", loglevel="DEBUG", logenabled=False):
         super(Config, self).__init__()
         self.min_func_length = min_func_length
         # TODO: get pointer_size from IDA
@@ -68,7 +75,7 @@ class Config(object):
         if idc.__EA64__:
             # HTC (TQN)
             # on AMD x64, still 4, not 8
-            # IDA flair tool always create "0000"
+            # IDA flair tool always create "XXXX"
             self.pointer_size = 4
         self.mode = mode
         self.pat_append = pat_append
@@ -127,6 +134,9 @@ CRC16_TABLE = [
 
 # ported from IDB2SIG plugin updated by TQN
 def crc16(data, crc):
+    if not data or len(data) == 0:
+        return 0
+
     for byte in data:
         crc = (crc >> 8) ^ CRC16_TABLE[(crc ^ ord(byte)) & 0xFF]
     crc = (~crc) & 0xFFFF
@@ -156,9 +166,8 @@ def get_func_at_ea(ea):
     return f
 
 
-def find_ref_loc(config, ea, ref):
+def find_ref_loc(ea, ref):
     """
-    type config: Config
     type ea: idc.ea_t
     type ref: idc.ea_t
     """
@@ -170,25 +179,34 @@ def find_ref_loc(config, ea, ref):
         logger.debug("Bad parameter: ref")
         return idc.BADADDR
 
-    o = idc.get_operand_type(ea, 0)
-    if o == idc.o_near or o == idc.o_far or o == idc.o_reg:   # HTC - add o_far, o_reg operand
-        # Cat Bui - use get_operand_value to get real ref value
-        op_offset = 1
-        if o == idc.o_near:
-            op_offset = 0
-        real_addr = idc.get_operand_value(ea, op_offset)
-        if (ref != real_addr):
-            ref = real_addr
+    insn = idaapi.insn_t()
+    idaapi.decode_insn(insn, ea)
 
-        ref = (ref - idc.get_item_end(ea)) & ((1 << config.pointer_size * 8) - 1)
+    op_num = 0
+    for idx in range(len(insn.ops)):
+        if insn.ops[idx].type == idaapi.o_void:
+            op_num = idx
+            break
 
-    if idc.is_code(idc.get_full_flags(ea)):
-        for i in zrange(ea, max(ea, 1 + idc.get_item_end(ea) - config.pointer_size)):
-            if idaapi.get_dword(i) == ref:
-                logger.debug(str("ea = 0x%X, end = 0x%X, ref = 0x%X, return i = 0x%X" % (ea, idc.get_item_end(ea), ref, i)))
-                return i
+    for idx in range(op_num):
+        op = insn.ops[idx]
+        if op.type not in [idaapi.o_reg, idaapi.o_mem, idaapi.o_imm, idaapi.o_far, idaapi.o_near]:
+            continue
 
-    return idc.BADADDR
+        # HTC - raw, dummy fix
+        start = op.offb
+        if start == 0:
+            start = insn.ops[idx + 1].offb
+        if idx < op_num - 1:
+            end = insn.ops[idx + 1].offb
+            if end == start:
+                end = insn.size
+        else:
+            end = insn.size
+
+        return (start, end)
+
+    return (idc.BADADDR, idc.BADADDR)
 
 
 def to_bytestring(seq):
@@ -217,105 +235,92 @@ def make_func_sig(config, func):
         logger.debug("Function is too short")
         raise FuncTooShortException()
 
-    ea = func.start_ea
-    publics = []  # type: idc.ea_t
+    publics = []  # type: tuple(idc.ea_t, name)
     refs = {}  # type: dict(idc.ea_t, idc.ea_t)
     variable_bytes = set([])  # type: set of idc.ea_t
 
+    func_len = func.end_ea - func.start_ea
+
+    # get function name and all public names in function
+    func_name = idc.get_func_name(func.start_ea)
+    if func_name == "":
+        func_name = "?" # pat standard
+
+    ea = func.start_ea
     while ea != idc.BADADDR and ea < func.end_ea:
-        logger.debug("ea: %s", hex(ea))
-
-        # HTC - remove dummy, auto names
-        name = None
-        if idaapi.has_name(idc.get_full_flags(ea)):
+        if ea > func.start_ea:  # skip first byte
             name = idc.get_name(ea)
-
-        if name is not None and name != "":
-            logger.debug(str("ea 0x%X has a name %s" % (ea, name)))
-            publics.append(ea)
+            if name != "" and idaapi.is_uname(name):
+                logger.debug(str("ea 0x%X has a name %s" % (ea, name)))
+                publics.append((ea, name))
 
         ref = idc.get_first_dref_from(ea)
         if ref != idc.BADADDR:
             # data ref
             logger.debug(str("ea 0x%X has data ref 0x%X" % (ea, ref)))
-            ref_loc = find_ref_loc(config, ea, ref)
-            if ref_loc != idc.BADADDR:
-                logger.debug(str("  ref loc: 0x%X" % ref_loc))
-                for i in zrange(config.pointer_size):
-                    logger.debug(str("    variable 0x%X" % (ref_loc + i)))
-                    variable_bytes.add(ref_loc + i)
-                refs[ref_loc] = ref
-            #
-            # HTC - old bug of TQN, do not need to check get_next_dref_from
-            #
+            start, end = find_ref_loc(ea, ref)
+            if start != idc.BADADDR:
+                logger.debug(str("data ref: %s - %X - %X - %X" % (func_name, ea, start, end)))
+                logger.debug(str("\tref_loc: 0x%X - size %d" % (ea + start, end - start)))
+                for i in range(start, end):
+                    logger.debug(str("\tvariable 0x%X" % (ea + i)))
+                    variable_bytes.add(ea + i)
+                refs[ea + start] = ref
         else:
             # code ref
             ref = idc.get_first_fcref_from(ea)
             if ref != idc.BADADDR:
-                logger.debug("has code ref")
+                logger.debug(str("ea 0x%X has code ref 0x%X" % (ea, ref)))
                 if ref < func.start_ea or ref >= func.end_ea:
                     # code ref is outside function
-                    ref_loc = find_ref_loc(config, ea, ref)
-                    if idc.BADADDR != ref_loc:
-                        logger.debug("  ref loc: %s", hex(ref_loc))
-                        for i in zrange(config.pointer_size):
-                            logger.debug("    variable %s", hex(ref_loc + i))
-                            variable_bytes.add(ref_loc + i)
-                        refs[ref_loc] = ref
+                    start, end = find_ref_loc(ea, ref)
+                    if start != idc.BADADDR:
+                        logger.debug(str("code ref: %s - %X - %d - %d" % (func_name, ea, start, end)))
+                        logger.debug(str("\tref_loc: 0x%X - size %d" % (ea + start, end - start)))
+                        for i in range(start, end):
+                            logger.debug(str("\tvariable 0x%X" % (ea + i)))
+                            variable_bytes.add(ea + i)
+                        refs[ea + start] = ref
 
         ea = idc.next_not_tail(ea)
 
-    sig = ""
     # first 32 bytes, or til end of function
+    sig = ""
     for ea in zrange(func.start_ea, min(func.start_ea + 32, func.end_ea)):
         if ea in variable_bytes:
             sig += ".."
         else:
             sig += "%02X" % (idaapi.get_byte(ea))
 
-    sig += ".." * (32 - (len(sig) / 2))
-
-    if func.end_ea - func.start_ea > 32:
-        crc_data = [0 for i in zrange(256)]
+    if func_len > 32:
+        crc_len = min(func_len - 32, 0xff)
 
         # for 255 bytes starting at index 32, or til end of function, or variable byte
-        for loc in zrange(32, min(func.end_ea - func.start_ea, 32 + 255)):
-            if func.start_ea + loc in variable_bytes:
+        for off in range(crc_len):
+            if func.start_ea + 32 + off in variable_bytes:
+                crc_len = off
                 break
 
-            crc_data[loc - 32] = idaapi.get_byte(func.start_ea + loc)
-        else:
-            loc += 1
-
-        # TODO: is this required everywhere? ie. with variable bytes?
-        alen = loc - 32
-
-        crc = crc16(to_bytestring(crc_data[:alen]), crc=0xFFFF)
+        crc = crc16(idaapi.get_bytes(func.start_ea + 32, crc_len), crc=0xFFFF)
     else:
-        loc = func.end_ea - func.start_ea
-        alen = 0
+        sig += ".." * (32 - func_len)
+        crc_len = 0
         crc = 0
 
-    sig += " %02X" % (alen)
+    sig += " %02X" % (crc_len)
     sig += " %04X" % (crc)
-    # TODO: does this need to change for 64bit?
-    sig += " %04X" % (func.end_ea - func.start_ea)
+    sig += " %04X" % min(func_len, MAX_FUNC_LEN)
 
-    # this will be either " :%04d %s" or " :%08d %s"
-    public_format = " :%%0%dX %%s" % (config.pointer_size)
-    for public in publics:
-        name = idc.get_name(public)
-        # HTC - Don't need to check again name in publics.
-        #   We have already check above
-        sig += public_format % (public - func.start_ea, name)
+    sig += " :0000 %s" % (func_name)
+
+    for ea, name in publics:
+        # @ at end of offset, for local public name, pat standard
+        sig += " :%04X@ %s" % (ea - func.start_ea, name)
 
     for ref_loc, ref in sorted(refs.iteritems()):
         # HTC - remove dummy, auto names
-        name = None
-        if idaapi.has_name(idc.get_full_flags(ref)):
-            name = idc.get_name(ref)
-
-        if name is None or name == "":
+        name = idc.get_name(ref)
+        if name == "" or not idaapi.is_uname(name):
             continue
 
         logger.debug(str("ref_loc = 0x%X - ref = 0x%X - name = %s" % (ref_loc, ref, name)))
@@ -331,14 +336,13 @@ def make_func_sig(config, func):
         sig += ref_format % (addr, name)
 
     # Tail of the module starts at the end of the CRC16 block.
-    if loc < func.end_ea - func.start_ea:
-        tail = " "
-        for ea in zrange(func.start_ea + loc, min(func.end_ea, func.start_ea + 0x8000)):
+    if func_len > 32 + crc_len:
+        sig += " "
+        for ea in range(func.start_ea + 32 + crc_len, min(func.end_ea, func.start_ea + MAX_FUNC_LEN)):
             if ea in variable_bytes:
-                tail += ".."
+                sig += ".."
             else:
-                tail += "%02X" % (idaapi.get_byte(ea))
-        sig += tail
+                sig += "%02X" % (idaapi.get_byte(ea))
 
     logger.debug("sig: %s", sig)
     return sig
@@ -366,7 +370,9 @@ def make_func_sigs(config):
 
     elif config.mode == NON_AUTO_FUNCTIONS:
         for f in get_functions():
-            if idaapi.has_name(idc.get_full_flags(f.start_ea)) and f.flags & idc.FUNC_LIB == 0:
+            # HTC - remove check FUNC_LIB flag to include library functions
+            if idaapi.has_name(idc.get_full_flags(f.start_ea)):
+                # and f.flags & idc.FUNC_LIB == 0:
                 try:
                     sigs.append(make_func_sig(config, f))
                 except FuncTooShortException:
@@ -479,21 +485,32 @@ def main():
         return
 
     sigs = make_func_sigs(c)
-
-    if c.pat_append:
-        with open(filename, "ab") as f:
-            for sig in sigs:
-                f.write(sig)
-                f.write("\r\n")
-            f.write("---")
-            f.write("\r\n")
+    if not sigs:
+        g_logger.info("No pat signature was created")
     else:
-        with open(filename, "wb") as f:
-            for sig in sigs:
-                f.write(sig)
-                f.write("\r\n")
-            f.write("---")
+        g_logger.info(str("Created %d signatures" % len(sigs)))
+
+    old_sigs = None
+    if c.pat_append:
+        if os.path.exists(filename):
+            with open(filename, "rb") as f:
+                old_sigs = f.readlines()
+                f.close()
+
+    with open(filename, "wb") as f:
+        if old_sigs:
+            for sig in old_sigs:
+                sig = sig.strip()
+                if sig not in ["", "---"]:
+                    sigs.append(sig)
+
+        for sig in sigs:
+            f.write(sig)
             f.write("\r\n")
+        f.write("---")
+        f.write("\r\n")
+        f.close()
+    g_logger.info(str("File %s have total %d signatures" % (filename, len(sigs))))
 
 if __name__ == "__main__":
     main()
